@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -47,7 +48,8 @@ func PathExists(path string) (bool, error) {
 // filePath 大文件的文件路径
 // prefix 是输出目标文件名称的前缀
 // size 每个小文件的大小
-func SplitFile(filePath, prefix string, size int) {
+// count 返回小文件数量
+func SplitFile(filePath, prefix string, size int) (count int) {
 	if !IsFile(filePath) {
 		panic("文件错误")
 	}
@@ -66,30 +68,47 @@ func SplitFile(filePath, prefix string, size int) {
 		panic(err.Error())
 	}
 	defer fd.Close()
-
-	buf := make([]byte, size)
-	reader := bufio.NewReader(fd)
-	index := 0
-	for {
-		subfilename := path.Join(dirname, "/", prefix, "-", strconv.Itoa(index), "."+ext)
-		destFile, err := os.OpenFile(subfilename, syscall.O_CREAT|syscall.O_WRONLY, 0777)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		writter := bufio.NewWriter(destFile)
-		n, err := reader.Read(buf)
-		if err == io.EOF { //文件已读取完
-			break
-		} else if err != nil {
-			return
-		}
-		writter.Write(buf[n:])
-		writter.Flush()
-		index++
-		destFile.Close()
+	info, err := fd.Stat()
+	if err != nil {
+		panic(err.Error())
 	}
+	filesize := info.Size()
+	//创建SectionReader对象，用于范围读取文件
+	reader := io.NewSectionReader(fd, 0, filesize)
+	index := 0
+	n := int(math.Ceil(float64(filesize) / float64(size)))
+	var wg sync.WaitGroup
+	for ; index < n; index++ {
+		wg.Add(1)
+		go func(i int, reader *io.SectionReader) {
+			defer wg.Done()
 
+			buf := make([]byte, size)
+			reader.Seek(int64(i*size), io.SeekStart)
+			n, err := reader.Read(buf)
+			if err == io.EOF { //文件已读取完
+				return
+			} else if err != nil {
+				return
+			}
+
+			subfilename := prefix + "-" + strconv.Itoa(i) + ext
+			subfilepath := path.Join(dirname, "/", subfilename)
+			destFile, err := os.OpenFile(subfilepath, syscall.O_CREAT|syscall.O_WRONLY, 0777)
+			if err != nil {
+				panic(err.Error())
+			}
+			defer destFile.Close()
+
+			writer := bufio.NewWriter(destFile)
+			writer.Write(buf[:n])
+			writer.Flush()
+
+		}(index, reader)
+	}
+	wg.Wait()
+
+	return index
 }
 
 // Basename 分别返回文件的文件名和扩展名
@@ -103,23 +122,32 @@ func Basename(filepath string) (filename, ext string) {
 // MergeFile 将一个目录下的小文件合并成一个大文件
 // dirname 是要合并的小文件所在目录， filename 是输出目标文件名称
 func MergeFile(dirname, filename string) {
-	chunksPath := path.Join(strings.TrimLeft(dirname, "/"), "/")
+	chunksPath := path.Join(strings.TrimRight(dirname, "/"), "/")
 	files, err := os.ReadDir(chunksPath)
 	if err != nil {
 		panic("目录不能正常访问")
 	}
+
 	// 排序
 	filesSort := make(map[string]string)
 	for _, f := range files {
-		nameArr := strings.Split(f.Name(), "-")
-		filesSort[nameArr[1]] = f.Name()
+		if !f.IsDir() {
+			//获取文件的文件名和扩展名
+			filename, _ := Basename(f.Name())
+			nameArr := strings.Split(filename, "-")
+			if 2 == len(nameArr) {
+				filesSort[nameArr[1]] = f.Name()
+			}
+		}
 	}
+
 	filesCount := len(files)
 	if filesCount != len(filesSort) {
-		panic("文件错误：有重复的文件")
+		panic("文件读取异常")
 	}
 
 	saveFile := path.Join(chunksPath, filename)
+	fmt.Println(saveFile)
 	if exists, _ := PathExists(saveFile); exists {
 		os.Remove(saveFile)
 	}
@@ -130,16 +158,40 @@ func MergeFile(dirname, filename string) {
 	wg.Add(filesCount)
 	for i := 0; i < filesCount; i++ {
 		// 要注意按顺序读取，否则文件就会损坏
-		fileName := path.Join(chunksPath, "/"+filesSort[strconv.Itoa(i)])
+		fileName := path.Join(chunksPath, filesSort[strconv.Itoa(i)])
 		data, err := os.ReadFile(fileName)
 		if err != nil {
 			fmt.Println(err)
 		}
 		fs.Write(data)
-
 		wg.Done()
 	}
 	wg.Wait()
+}
+
+// CopyFile 拷贝文件，将源文件srcFileName的内容拷贝到目标文件dstFileName
+func CopyFile(dstFileName string, srcFileName string) (written int64, err error) {
+	srcFile, err := os.Open(srcFileName)
+	if err != nil {
+		fmt.Printf("open file err=%v\n", err)
+		return
+	}
+	defer srcFile.Close()
+
+	reader := bufio.NewReader(srcFile)
+
+	//打开dstFileName，不存在则创建
+	dstFile, err := os.OpenFile(dstFileName, os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		fmt.Printf("open file err=%v\n", err)
+		return
+	}
+
+	//通过dstFile, 获取到 Writer
+	writer := bufio.NewWriter(dstFile)
+	defer dstFile.Close()
+
+	return io.Copy(writer, reader)
 }
 
 // 获取整体文件夹大小
@@ -226,4 +278,10 @@ func GetAllFile(dirname string) ([]string, error) {
 		}
 	}
 	return files, nil
+}
+
+// IsDir 判断指定的路径是否是目录
+func Ungz(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
